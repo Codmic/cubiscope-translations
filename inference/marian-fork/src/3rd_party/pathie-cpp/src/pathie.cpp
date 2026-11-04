@@ -111,6 +111,12 @@ std::wstring Pathie::utf8_to_utf16(std::string str)
  */
 std::string Pathie::convert_encodings(const char* from_encoding, const char* to_encoding, const std::string& string)
 {
+#if defined(__ANDROID__) && __ANDROID_API__ < 28
+  // iconv arrives in Android 9 (API 28). Android's filesystem encoding is always UTF-8, so the
+  // conversion is an identity; callers skip it when both sides are UTF-8 anyway.
+  (void)from_encoding; (void)to_encoding;
+  return string;
+#else
   size_t input_length = string.length();
 
   // We need a C string working copy that isn’t const
@@ -173,6 +179,7 @@ std::string Pathie::convert_encodings(const char* from_encoding, const char* to_
   free(outbuf);
 
   return result;
+#endif
 }
 
 /**

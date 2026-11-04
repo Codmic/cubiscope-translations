@@ -3172,7 +3172,11 @@ Path Path::global_programs_dir()
 ///
 std::vector<Path> Path::glob(const std::string& pattern, int flags /* = 0 */)
 {
-#if defined(_PATHIE_UNIX)
+#if defined(__ANDROID__) && __ANDROID_API__ < 28
+  // glob(3) arrives in Android 9 (API 28); nothing in the translator globs.
+  (void)pattern; (void)flags;
+  throw(GlobError(GLOB_ABORTED));
+#elif defined(_PATHIE_UNIX)
   std::string nstr = utf8_to_filename(pattern);
   glob_t globinfo;
   int result = ::glob(nstr.c_str(), flags, NULL, &globinfo);
