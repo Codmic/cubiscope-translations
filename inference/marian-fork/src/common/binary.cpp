@@ -89,7 +89,22 @@ void loadItems(const void* current, std::vector<io::Item>& items, bool mapped) {
     const char* ptr = get<char>(current, headers[i].dataLength);
 
     if(matchType<intgemm8>(items[i].type)) {
-      if(items[i].name.find("Wemb") != std::string::npos) {  // Since Wemb need to be dequantised,
+#ifdef ARM
+      // Cubiscope: on ARM keep Wemb int8 like every other weight (a plain copy plus its quantMult;
+      // Wemb is stored row-major [vocab x dim], untransposed). Embedding lookups dequantise only
+      // the rows they need (DequantizeRowsNodeOp) and the tied output layer selects the
+      // shortlisted rows straight from it (SelectColumnsBRuyNodeOp), which saves the float32
+      // copy (4x the int8 size) and the per-batch requantisation of the whole matrix.
+      // Only the matrices themselves ("Wemb", "encoder_Wemb", "decoder_Wemb"): other items named
+      // after Wemb, such as the output layer's activation alpha "Wemb_QuantMultA", are stored with
+      // this type too and must keep the dequantised (float32) handling they always had.
+      const std::string& wembName = items[i].name;
+      const bool isWembMatrix = wembName.size() >= 4 && wembName.compare(wembName.size() - 4, 4, "Wemb") == 0;
+      const bool dequantiseWemb = wembName.find("Wemb") != std::string::npos && !isWembMatrix;
+#else
+      const bool dequantiseWemb = items[i].name.find("Wemb") != std::string::npos;
+#endif
+      if(dequantiseWemb) {  // Since Wemb need to be dequantised,
                                                              // we have a special case for them
         items[i].type = Type::float32;
         resize(items[i].shape.elements()

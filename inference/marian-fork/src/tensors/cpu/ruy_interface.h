@@ -325,8 +325,13 @@ bool transpose_;
 struct SelectColumnsBRuyNodeOp : public UnaryNodeOp {
 public:
   float quantMult_;
-  SelectColumnsBRuyNodeOp(Expr input, const std::vector<uint_least32_t>  &indices)
-      : UnaryNodeOp(input, newShape(input, indices), input->value_type()),  indices_(indices) {
+  // Cubiscope: rowMajorEmbedding = the input is an int8 embedding parameter [vocab x dim] kept
+  // quantised at load (binary.cpp), used as the tied output layer's B = Wemb^T [dim x vocab].
+  // Its row-major storage is exactly B's column-major one, so selecting columns of B is
+  // copying rows of length dim, and the quantMult sits after the data like any int8 weight.
+  SelectColumnsBRuyNodeOp(Expr input, const std::vector<uint_least32_t>  &indices, bool rowMajorEmbedding = false)
+      : UnaryNodeOp(input, newShape(input, indices, rowMajorEmbedding), input->value_type()),  indices_(indices),
+        rowMajorEmbedding_(rowMajorEmbedding) {
 
     set_name(input->name());
     setMemoize(false); // Enabling memoization leads to a massive memory leak.
@@ -341,13 +346,16 @@ public:
       if (child(0)->type() == "RuyPrepareB") {
         auto bPreppedNode = std::static_pointer_cast<PrepareNode>(child(0));
         quantMult_ = bPreppedNode->quantMult_;
+      } else if (rowMajorEmbedding_ && isIntgemm(child(0)->value_type())) {
+        auto in = child(0)->val();
+        quantMult_ = *(reinterpret_cast<const float *>(in->data<int8_t>() + in->shape().elements()));
       } else {
         ABORT("We should not be here");
       }
       auto input = child(0)->val();
       SelectColumnsB(reinterpret_cast<int8_t *>(input->data()),
                     val_->data<int8_t>(),
-                    rows(input),
+                    rowMajorEmbedding_ ? cols(input) : rows(input),
                     indices_.data(),
                     indices_.data()+indices_.size());
     }};
@@ -372,13 +380,60 @@ public:
   }
 
 private:
-  static Shape newShape(Expr a, const std::vector<uint_least32_t>& indices) {
+  static Shape newShape(Expr a, const std::vector<uint_least32_t>& indices, bool rowMajorEmbedding) {
+    if (rowMajorEmbedding)
+      return Shape({a->shape()[-1], (int)indices.size()});
     Shape ret = a->shape();
     ret.set(1, indices.size());
     return ret;
   }
 
   std::vector<uint_least32_t> indices_;
+  bool rowMajorEmbedding_;
+};
+
+// Cubiscope: embedding lookup on an int8 embedding parameter kept quantised at load (binary.cpp).
+// Same result as rows() on the float matrix the loader used to build: each selected row is
+// dequantised with value * (1 / quantMult), the loader's own formula, so outputs are unchanged.
+struct DequantizeRowsNodeOp : public NaryNodeOp {
+  DequantizeRowsNodeOp(Expr input, Expr indices)
+      : NaryNodeOp({input, indices}, newShape(input, indices), Type::float32) {
+    matchOrAbort<IndexType>(indices->value_type());
+    ABORT_IF(!isIntgemm(input->value_type()), "DequantizeRows expects an int8 embedding matrix");
+    setMemoize(false);
+  }
+
+  NodeOps forwardOps() override {
+    return { [=]() {
+      auto in = child(0)->val();
+      const int8_t *matrix = in->data<int8_t>();
+      const int dim = in->shape()[-1];
+      const int vocab = in->shape()[0];
+      const float scale = 1 / *(reinterpret_cast<const float *>(matrix + in->shape().elements()));
+      auto idx = child(1)->val();
+      const IndexType *indices = idx->data<IndexType>();
+      const int n = (int)idx->size();
+      float *out = val_->data();
+      for (int i = 0; i < n; ++i) {
+        ABORT_IF((int)indices[i] >= vocab, "Embedding index {} out of range {}", indices[i], vocab);
+        const int8_t *row = matrix + (size_t)indices[i] * dim;
+        float *dst = out + (size_t)i * dim;
+        for (int j = 0; j < dim; ++j)
+          dst[j] = row[j] * scale;
+      }
+    }};
+  }
+
+  static Shape newShape(Expr a, Expr indices) {
+    return Shape({(int)indices->shape().elements(), a->shape()[-1]});
+  }
+
+  NodeOps backwardOps() override {
+    ABORT("Only used for inference");
+    return {NodeOp(0)};
+  }
+
+  const std::string type() override { return "DequantizeRows"; }
 };
 
 struct QuantMultRuyNodeOp : public UnaryNodeOp {

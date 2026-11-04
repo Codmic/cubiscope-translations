@@ -299,7 +299,9 @@ namespace marian {
         if ((graph_->getBackend()->isInt8() || matchType<intgemm8>(Wt_->value_type()) )&& graph_->getDeviceId().type == DeviceType::cpu) {
 #ifdef ARM
             if (matchType<intgemm8>(Wt_->value_type())) {
-              cachedShortWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(Wt_, shortlist_->indices());
+              // Cubiscope: an int8 Wt_ here is the tied embedding kept quantised (binary.cpp).
+              ABORT_IF(!tiedParam_ || isLegacyUntransposedW, "int8 output weights are only supported as a tied embedding");
+              cachedShortWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(Wt_, shortlist_->indices(), /*rowMajorEmbedding=*/true);
             } else {
               Expr bQuantMult = Expression<marian::cpu::integer::QuantMultRuyNodeOp>(Wt_, true, Wt_->name());
               Expr bPrep = Expression<marian::cpu::integer::PrepareNode>(Wt_, bQuantMult, !isLegacyUntransposedW, true);
@@ -352,6 +354,7 @@ namespace marian {
       }
 
       if (factoredVocab_) {
+        ABORT_IF(isIntgemm(Wt_->value_type()), "Factored vocabularies need a float32 Wemb (Cubiscope keeps it int8 on ARM)");
         auto graph = input->graph();
 
         // project each factor separately
@@ -494,6 +497,8 @@ namespace marian {
       } else if (shortlist_) {
         return Logits(affineOrLSH(input, cachedShortWt_, cachedShortb_, false, /*transB=*/isLegacyUntransposedW ? false : true));
       } else {
+        // Cubiscope: the int8 embedding (binary.cpp) is only wired up for the shortlisted output.
+        ABORT_IF(isIntgemm(Wt_->value_type()) && tiedParam_, "An int8 tied embedding needs a lexical shortlist");
         return Logits(affineOrLSH(input, Wt_, b_, false, /*transB=*/isLegacyUntransposedW ? false : true));
       }
     }
@@ -610,7 +615,14 @@ namespace marian {
     ABORT_IF(factoredVocab_, "Embedding: applyIndices must not be used with a factored vocabulary");
     auto embIdxExpr = E_->graph()->indices(embIdx);
     embIdxExpr->set_name("data_" + std::to_string(/*batchIndex_=*/0));  // @TODO: how to know the batch index?
+#ifdef ARM
+    // Cubiscope: Wemb stays int8 on ARM (binary.cpp); dequantise just the rows looked up.
+    auto selectedEmbs = isIntgemm(E_->value_type())
+        ? Expression<marian::cpu::integer::DequantizeRowsNodeOp>(E_, embIdxExpr)
+        : rows(E_, embIdxExpr);                   // [(B*W) x E]
+#else
     auto selectedEmbs = rows(E_, embIdxExpr);     // [(B*W) x E]
+#endif
     selectedEmbs = reshape(selectedEmbs, shape);  // [W, B, E]
     // @BUGBUG: We should not broadcast along dimBatch=[-2]. Then we can also dropout before reshape() (test that separately)
     selectedEmbs = dropout(selectedEmbs, options_->get<float>("dropout", 0.0f), { selectedEmbs->shape()[-3], 1, 1 });
