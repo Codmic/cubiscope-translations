@@ -88,6 +88,9 @@ void TranslationModel::loadBackend(size_t idx) {
     });
 
     scorerEnsemble = createScorers(options_, container);
+    // createScorers has copied every item out of the bundle; drop the raw bytes now rather than
+    // after the first forward pass, so they are not resident alongside the items and the graph.
+    memory_.models.clear();
   } else {
     // load npz format models, or a mixture of binary/npz formats
     scorerEnsemble = createScorers(options_);
