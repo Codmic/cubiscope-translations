@@ -1,0 +1,175 @@
+diff --git a/inference/marian-fork/src/common/binary.cpp b/inference/marian-fork/src/common/binary.cpp
+index 02d105c..021c198 100644
+--- a/inference/marian-fork/src/common/binary.cpp
++++ b/inference/marian-fork/src/common/binary.cpp
+@@ -89,7 +89,22 @@ void loadItems(const void* current, std::vector<io::Item>& items, bool mapped) {
+     const char* ptr = get<char>(current, headers[i].dataLength);
+ 
+     if(matchType<intgemm8>(items[i].type)) {
+-      if(items[i].name.find("Wemb") != std::string::npos) {  // Since Wemb need to be dequantised,
++#ifdef ARM
++      // Cubiscope: on ARM keep Wemb int8 like every other weight (a plain copy plus its quantMult;
++      // Wemb is stored row-major [vocab x dim], untransposed). Embedding lookups dequantise only
++      // the rows they need (DequantizeRowsNodeOp) and the tied output layer selects the
++      // shortlisted rows straight from it (SelectColumnsBRuyNodeOp), which saves the float32
++      // copy (4x the int8 size) and the per-batch requantisation of the whole matrix.
++      // Only the matrices themselves ("Wemb", "encoder_Wemb", "decoder_Wemb"): other items named
++      // after Wemb, such as the output layer's activation alpha "Wemb_QuantMultA", are stored with
++      // this type too and must keep the dequantised (float32) handling they always had.
++      const std::string& wembName = items[i].name;
++      const bool isWembMatrix = wembName.size() >= 4 && wembName.compare(wembName.size() - 4, 4, "Wemb") == 0;
++      const bool dequantiseWemb = wembName.find("Wemb") != std::string::npos && !isWembMatrix;
++#else
++      const bool dequantiseWemb = items[i].name.find("Wemb") != std::string::npos;
++#endif
++      if(dequantiseWemb) {  // Since Wemb need to be dequantised,
+                                                              // we have a special case for them
+         items[i].type = Type::float32;
+         resize(items[i].shape.elements()
+diff --git a/inference/marian-fork/src/layers/generic.cpp b/inference/marian-fork/src/layers/generic.cpp
+index 0c22967..a13974d 100755
+--- a/inference/marian-fork/src/layers/generic.cpp
++++ b/inference/marian-fork/src/layers/generic.cpp
+@@ -299,7 +299,9 @@ namespace marian {
+         if ((graph_->getBackend()->isInt8() || matchType<intgemm8>(Wt_->value_type()) )&& graph_->getDeviceId().type == DeviceType::cpu) {
+ #ifdef ARM
+             if (matchType<intgemm8>(Wt_->value_type())) {
+-              cachedShortWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(Wt_, shortlist_->indices());
++              // Cubiscope: an int8 Wt_ here is the tied embedding kept quantised (binary.cpp).
++              ABORT_IF(!tiedParam_ || isLegacyUntransposedW, "int8 output weights are only supported as a tied embedding");
++              cachedShortWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(Wt_, shortlist_->indices(), /*rowMajorEmbedding=*/true);
+             } else {
+               Expr bQuantMult = Expression<marian::cpu::integer::QuantMultRuyNodeOp>(Wt_, true, Wt_->name());
+               Expr bPrep = Expression<marian::cpu::integer::PrepareNode>(Wt_, bQuantMult, !isLegacyUntransposedW, true);
+@@ -352,6 +354,7 @@ namespace marian {
+       }
+ 
+       if (factoredVocab_) {
++        ABORT_IF(isIntgemm(Wt_->value_type()), "Factored vocabularies need a float32 Wemb (Cubiscope keeps it int8 on ARM)");
+         auto graph = input->graph();
+ 
+         // project each factor separately
+@@ -494,6 +497,8 @@ namespace marian {
+       } else if (shortlist_) {
+         return Logits(affineOrLSH(input, cachedShortWt_, cachedShortb_, false, /*transB=*/isLegacyUntransposedW ? false : true));
+       } else {
++        // Cubiscope: the int8 embedding (binary.cpp) is only wired up for the shortlisted output.
++        ABORT_IF(isIntgemm(Wt_->value_type()) && tiedParam_, "An int8 tied embedding needs a lexical shortlist");
+         return Logits(affineOrLSH(input, Wt_, b_, false, /*transB=*/isLegacyUntransposedW ? false : true));
+       }
+     }
+@@ -610,7 +615,14 @@ namespace marian {
+     ABORT_IF(factoredVocab_, "Embedding: applyIndices must not be used with a factored vocabulary");
+     auto embIdxExpr = E_->graph()->indices(embIdx);
+     embIdxExpr->set_name("data_" + std::to_string(/*batchIndex_=*/0));  // @TODO: how to know the batch index?
++#ifdef ARM
++    // Cubiscope: Wemb stays int8 on ARM (binary.cpp); dequantise just the rows looked up.
++    auto selectedEmbs = isIntgemm(E_->value_type())
++        ? Expression<marian::cpu::integer::DequantizeRowsNodeOp>(E_, embIdxExpr)
++        : rows(E_, embIdxExpr);                   // [(B*W) x E]
++#else
+     auto selectedEmbs = rows(E_, embIdxExpr);     // [(B*W) x E]
++#endif
+     selectedEmbs = reshape(selectedEmbs, shape);  // [W, B, E]
+     // @BUGBUG: We should not broadcast along dimBatch=[-2]. Then we can also dropout before reshape() (test that separately)
+     selectedEmbs = dropout(selectedEmbs, options_->get<float>("dropout", 0.0f), { selectedEmbs->shape()[-3], 1, 1 });
+diff --git a/inference/marian-fork/src/tensors/cpu/ruy_interface.h b/inference/marian-fork/src/tensors/cpu/ruy_interface.h
+index e9d1c99..e680fd8 100644
+--- a/inference/marian-fork/src/tensors/cpu/ruy_interface.h
++++ b/inference/marian-fork/src/tensors/cpu/ruy_interface.h
+@@ -325,8 +325,13 @@ bool transpose_;
+ struct SelectColumnsBRuyNodeOp : public UnaryNodeOp {
+ public:
+   float quantMult_;
+-  SelectColumnsBRuyNodeOp(Expr input, const std::vector<uint_least32_t>  &indices)
+-      : UnaryNodeOp(input, newShape(input, indices), input->value_type()),  indices_(indices) {
++  // Cubiscope: rowMajorEmbedding = the input is an int8 embedding parameter [vocab x dim] kept
++  // quantised at load (binary.cpp), used as the tied output layer's B = Wemb^T [dim x vocab].
++  // Its row-major storage is exactly B's column-major one, so selecting columns of B is
++  // copying rows of length dim, and the quantMult sits after the data like any int8 weight.
++  SelectColumnsBRuyNodeOp(Expr input, const std::vector<uint_least32_t>  &indices, bool rowMajorEmbedding = false)
++      : UnaryNodeOp(input, newShape(input, indices, rowMajorEmbedding), input->value_type()),  indices_(indices),
++        rowMajorEmbedding_(rowMajorEmbedding) {
+ 
+     set_name(input->name());
+     setMemoize(false); // Enabling memoization leads to a massive memory leak.
+@@ -341,13 +346,16 @@ public:
+       if (child(0)->type() == "RuyPrepareB") {
+         auto bPreppedNode = std::static_pointer_cast<PrepareNode>(child(0));
+         quantMult_ = bPreppedNode->quantMult_;
++      } else if (rowMajorEmbedding_ && isIntgemm(child(0)->value_type())) {
++        auto in = child(0)->val();
++        quantMult_ = *(reinterpret_cast<const float *>(in->data<int8_t>() + in->shape().elements()));
+       } else {
+         ABORT("We should not be here");
+       }
+       auto input = child(0)->val();
+       SelectColumnsB(reinterpret_cast<int8_t *>(input->data()),
+                     val_->data<int8_t>(),
+-                    rows(input),
++                    rowMajorEmbedding_ ? cols(input) : rows(input),
+                     indices_.data(),
+                     indices_.data()+indices_.size());
+     }};
+@@ -372,13 +380,60 @@ public:
+   }
+ 
+ private:
+-  static Shape newShape(Expr a, const std::vector<uint_least32_t>& indices) {
++  static Shape newShape(Expr a, const std::vector<uint_least32_t>& indices, bool rowMajorEmbedding) {
++    if (rowMajorEmbedding)
++      return Shape({a->shape()[-1], (int)indices.size()});
+     Shape ret = a->shape();
+     ret.set(1, indices.size());
+     return ret;
+   }
+ 
+   std::vector<uint_least32_t> indices_;
++  bool rowMajorEmbedding_;
++};
++
++// Cubiscope: embedding lookup on an int8 embedding parameter kept quantised at load (binary.cpp).
++// Same result as rows() on the float matrix the loader used to build: each selected row is
++// dequantised with value * (1 / quantMult), the loader's own formula, so outputs are unchanged.
++struct DequantizeRowsNodeOp : public NaryNodeOp {
++  DequantizeRowsNodeOp(Expr input, Expr indices)
++      : NaryNodeOp({input, indices}, newShape(input, indices), Type::float32) {
++    matchOrAbort<IndexType>(indices->value_type());
++    ABORT_IF(!isIntgemm(input->value_type()), "DequantizeRows expects an int8 embedding matrix");
++    setMemoize(false);
++  }
++
++  NodeOps forwardOps() override {
++    return { [=]() {
++      auto in = child(0)->val();
++      const int8_t *matrix = in->data<int8_t>();
++      const int dim = in->shape()[-1];
++      const int vocab = in->shape()[0];
++      const float scale = 1 / *(reinterpret_cast<const float *>(matrix + in->shape().elements()));
++      auto idx = child(1)->val();
++      const IndexType *indices = idx->data<IndexType>();
++      const int n = (int)idx->size();
++      float *out = val_->data();
++      for (int i = 0; i < n; ++i) {
++        ABORT_IF((int)indices[i] >= vocab, "Embedding index {} out of range {}", indices[i], vocab);
++        const int8_t *row = matrix + (size_t)indices[i] * dim;
++        float *dst = out + (size_t)i * dim;
++        for (int j = 0; j < dim; ++j)
++          dst[j] = row[j] * scale;
++      }
++    }};
++  }
++
++  static Shape newShape(Expr a, Expr indices) {
++    return Shape({(int)indices->shape().elements(), a->shape()[-1]});
++  }
++
++  NodeOps backwardOps() override {
++    ABORT("Only used for inference");
++    return {NodeOp(0)};
++  }
++
++  const std::string type() override { return "DequantizeRows"; }
+ };
+ 
+ struct QuantMultRuyNodeOp : public UnaryNodeOp {

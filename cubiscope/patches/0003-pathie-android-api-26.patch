@@ -1,0 +1,42 @@
+diff --git a/inference/marian-fork/src/3rd_party/pathie-cpp/src/path.cpp b/inference/marian-fork/src/3rd_party/pathie-cpp/src/path.cpp
+index e13d5ce..f3a45b8 100644
+--- a/inference/marian-fork/src/3rd_party/pathie-cpp/src/path.cpp
++++ b/inference/marian-fork/src/3rd_party/pathie-cpp/src/path.cpp
+@@ -3172,7 +3172,11 @@ Path Path::global_programs_dir()
+ ///
+ std::vector<Path> Path::glob(const std::string& pattern, int flags /* = 0 */)
+ {
+-#if defined(_PATHIE_UNIX)
++#if defined(__ANDROID__) && __ANDROID_API__ < 28
++  // glob(3) arrives in Android 9 (API 28); nothing in the translator globs.
++  (void)pattern; (void)flags;
++  throw(GlobError(GLOB_ABORTED));
++#elif defined(_PATHIE_UNIX)
+   std::string nstr = utf8_to_filename(pattern);
+   glob_t globinfo;
+   int result = ::glob(nstr.c_str(), flags, NULL, &globinfo);
+diff --git a/inference/marian-fork/src/3rd_party/pathie-cpp/src/pathie.cpp b/inference/marian-fork/src/3rd_party/pathie-cpp/src/pathie.cpp
+index d8e567e..bee72c0 100644
+--- a/inference/marian-fork/src/3rd_party/pathie-cpp/src/pathie.cpp
++++ b/inference/marian-fork/src/3rd_party/pathie-cpp/src/pathie.cpp
+@@ -111,6 +111,12 @@ std::wstring Pathie::utf8_to_utf16(std::string str)
+  */
+ std::string Pathie::convert_encodings(const char* from_encoding, const char* to_encoding, const std::string& string)
+ {
++#if defined(__ANDROID__) && __ANDROID_API__ < 28
++  // iconv arrives in Android 9 (API 28). Android's filesystem encoding is always UTF-8, so the
++  // conversion is an identity; callers skip it when both sides are UTF-8 anyway.
++  (void)from_encoding; (void)to_encoding;
++  return string;
++#else
+   size_t input_length = string.length();
+ 
+   // We need a C string working copy that isn’t const
+@@ -173,6 +179,7 @@ std::string Pathie::convert_encodings(const char* from_encoding, const char* to_
+   free(outbuf);
+ 
+   return result;
++#endif
+ }
+ 
+ /**

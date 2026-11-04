@@ -1,0 +1,18 @@
+diff --git a/inference/marian-fork/src/graph/node_initializers.cpp b/inference/marian-fork/src/graph/node_initializers.cpp
+index 9f7f3dd..81605bb 100755
+--- a/inference/marian-fork/src/graph/node_initializers.cpp
++++ b/inference/marian-fork/src/graph/node_initializers.cpp
+@@ -202,7 +202,12 @@ Ptr<NodeInitializer> fromItem(const io::Item& item) {
+     });
+   } else {
+     return fromLambda(
+-      [item](Tensor tensor) { tensor->set(item); },
++      [item](Tensor tensor) {
++        tensor->set(item);
++        // The tensor now owns a copy; release the item's bytes (shared with the scorer's copy)
++        // so model weights are not resident twice while the graph is being built.
++        std::vector<char>().swap(*item.bytes);
++      },
+       item.type);
+   }
+ }

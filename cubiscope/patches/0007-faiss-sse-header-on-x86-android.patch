@@ -1,0 +1,13 @@
+diff --git a/inference/marian-fork/src/3rd_party/faiss/VectorTransform.h b/inference/marian-fork/src/3rd_party/faiss/VectorTransform.h
+index f0ed144..94cf41f 100644
+--- a/inference/marian-fork/src/3rd_party/faiss/VectorTransform.h
++++ b/inference/marian-fork/src/3rd_party/faiss/VectorTransform.h
+@@ -18,7 +18,7 @@
+ #include <stdint.h>
+ 
+ #include <faiss/Index.h>
+-#if defined(__APPLE__) && !defined(__arm64__)
++#if (defined(__APPLE__) && !defined(__arm64__)) || defined(__SSE__)
+ #include <x86intrin.h>
+ #endif
+ 
