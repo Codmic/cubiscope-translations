@@ -18,7 +18,7 @@
 #include <stdint.h>
 
 #include <faiss/Index.h>
-#if defined(__APPLE__) && !defined(__arm64__)
+#if (defined(__APPLE__) && !defined(__arm64__)) || defined(__SSE__)
 #include <x86intrin.h>
 #endif
 
